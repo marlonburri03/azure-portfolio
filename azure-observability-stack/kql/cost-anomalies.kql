@@ -12,8 +12,9 @@ AzureCostManagement
 | where TimeGenerated > ago(30d)
 | summarize DailyCost = sum(CostInBillingCurrency) by Day = bin(TimeGenerated, 1d)
 | order by Day asc
-| extend MovingAvg7d = avg_of(prev(DailyCost, 1), prev(DailyCost, 2), prev(DailyCost, 3),
-    prev(DailyCost, 4), prev(DailyCost, 5), prev(DailyCost, 6), prev(DailyCost, 7))
+| serialize
+| extend MovingAvg7d = (prev(DailyCost, 1) + prev(DailyCost, 2) + prev(DailyCost, 3)
+    + prev(DailyCost, 4) + prev(DailyCost, 5) + prev(DailyCost, 6) + prev(DailyCost, 7)) / 7.0
 | where isnotnull(MovingAvg7d)
 | extend DeviationPct = round(100.0 * (DailyCost - MovingAvg7d) / MovingAvg7d, 1)
 | where abs(DeviationPct) > 30
