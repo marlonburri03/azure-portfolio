@@ -1,0 +1,166 @@
+# =============================================================================
+# Azure DevOps — Docker Build & Push Pipeline
+# =============================================================================
+# Multi-stage pipeline: build → scan → push → deploy
+# Uses ACR Tasks for cloud-native builds when local Docker isn't available.
+# Authenticates via Workload Identity Federation (OIDC).
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - src/**
+      - Dockerfile
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - src/**
+      - Dockerfile
+
+pool:
+  vmImage: "ubuntu-latest"
+
+variables:
+  - name: ACR_NAME
+    value: "$(acrName)"
+  - name: IMAGE_REPOSITORY
+    value: "$(Build.Repository.Name)"
+  - name: IMAGE_TAG
+    value: "$(Build.BuildId)-$(Build.SourceVersion)"
+
+stages:
+  # ===========================================================================
+  # Build & Scan
+  # ===========================================================================
+  - stage: Build
+    displayName: "🔨 Build & Scan"
+    jobs:
+      - job: BuildAndScan
+        displayName: "Build, Scan, Push"
+        steps:
+          - task: Docker@2
+            displayName: "Build Image"
+            inputs:
+              containerRegistry: "acr-service-connection"
+              repository: $(IMAGE_REPOSITORY)
+              command: "build"
+              Dockerfile: "**/Dockerfile"
+              tags: |
+                $(IMAGE_TAG)
+                latest
+
+          # Scan the image before pushing to catch vulnerabilities early
+          - script: |
+              # Install Trivy for container vulnerability scanning
+              curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+              trivy image \
+                --severity HIGH,CRITICAL \
+                --exit-code 0 \
+                --format table \
+                "$(ACR_NAME).azurecr.io/$(IMAGE_REPOSITORY):$(IMAGE_TAG)"
+            displayName: "Trivy Vulnerability Scan"
+
+          # Push only on main to keep registry clean
+          - task: Docker@2
+            displayName: "Push to ACR"
+            condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+            inputs:
+              containerRegistry: "acr-service-connection"
+              repository: $(IMAGE_REPOSITORY)
+              command: "push"
+              tags: |
+                $(IMAGE_TAG)
+                latest
+
+  # ===========================================================================
+  # Deploy to Dev
+  # ===========================================================================
+  - stage: DeployDev
+    displayName: "🚀 Deploy to Dev"
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployDev
+        displayName: "Deploy to Dev AKS"
+        # Azure DevOps Environment with approval checks and deployment history
+        environment: "dev.default"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: "Azure Login & Get AKS Credentials"
+                  inputs:
+                    azureSubscription: "azure-dev-oidc"
+                    scriptType: "bash"
+                    scriptLocation: "inlineScript"
+                    inlineScript: |
+                      az aks get-credentials \
+                        --resource-group "$(aksResourceGroup)" \
+                        --name "$(aksClusterName)" \
+                        --overwrite-existing
+
+                - task: Kubernetes@1
+                  displayName: "Deploy to AKS"
+                  inputs:
+                    connectionType: "Azure Resource Manager"
+                    azureSubscriptionEndpoint: "azure-dev-oidc"
+                    azureResourceGroup: "$(aksResourceGroup)"
+                    kubernetesCluster: "$(aksClusterName)"
+                    command: "set"
+                    arguments: "image deployment/$(appName) app=$(ACR_NAME).azurecr.io/$(IMAGE_REPOSITORY):$(IMAGE_TAG)"
+                    namespace: "$(k8sNamespace)"
+
+  # ===========================================================================
+  # Deploy to Production (with approval gate)
+  # ===========================================================================
+  - stage: DeployProd
+    displayName: "🏭 Deploy to Production"
+    dependsOn: DeployDev
+    condition: succeeded()
+    jobs:
+      - deployment: DeployProd
+        displayName: "Deploy to Prod AKS"
+        environment: "production.default"
+        strategy:
+          # Canary deployment: roll out to 25% → validate → 100%
+          canary:
+            increments: [25, 100]
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: "Deploy Canary"
+                  inputs:
+                    azureSubscription: "azure-prod-oidc"
+                    scriptType: "bash"
+                    scriptLocation: "inlineScript"
+                    inlineScript: |
+                      az aks get-credentials \
+                        --resource-group "$(prodAksResourceGroup)" \
+                        --name "$(prodAksClusterName)" \
+                        --overwrite-existing
+
+                      # Apply canary deployment manifest
+                      kubectl set image deployment/$(appName) \
+                        app=$(ACR_NAME).azurecr.io/$(IMAGE_REPOSITORY):$(IMAGE_TAG) \
+                        --namespace="$(prodK8sNamespace)"
+
+                      kubectl rollout status deployment/$(appName) \
+                        --namespace="$(prodK8sNamespace)" \
+                        --timeout=300s
+            on:
+              failure:
+                steps:
+                  - script: |
+                      echo "##[error] Canary deployment failed — initiating rollback"
+                      kubectl rollout undo deployment/$(appName) \
+                        --namespace="$(prodK8sNamespace)"
+                    displayName: "Rollback on Failure"

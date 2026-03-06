@@ -1,0 +1,185 @@
+# =============================================================================
+# Docker Build & Push to Azure Container Registry (ACR)
+# =============================================================================
+# Builds a multi-platform Docker image, scans it for vulnerabilities, and
+# pushes to ACR using OIDC federated credentials — no registry password stored.
+# Supports both PR validation (build + scan only) and deploy (push on merge).
+# =============================================================================
+
+name: "Docker Build & Push to ACR"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Dockerfile"
+      - ".github/workflows/docker-build-push-acr.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Dockerfile"
+
+concurrency:
+  group: docker-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write   # OIDC token exchange with Azure AD
+  contents: read
+  packages: write   # Push to GHCR as fallback/cache
+  security-events: write  # Upload Trivy SARIF results to Security tab
+
+env:
+  ACR_NAME: ${{ vars.ACR_NAME }}
+  IMAGE_NAME: ${{ vars.ACR_NAME }}.azurecr.io/${{ github.repository }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build, scan, and conditionally push the container image
+  # ---------------------------------------------------------------------------
+  build-and-push:
+    name: "Build, Scan & Push"
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+      image_digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Generate consistent image tags from git metadata
+      - name: Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            # Tag with short SHA for traceability back to source commit
+            type=sha,prefix=,format=short
+            # Semantic version tags from git tags (e.g., v1.2.3 → 1.2.3)
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            # Latest tag only on default branch
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # BuildKit cache dramatically speeds up rebuilds by reusing layers
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # OIDC login to Azure — exchanges GitHub JWT for Azure access token
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Use az cli to get an ACR access token — avoids storing registry creds
+      - name: ACR Login
+        run: az acr login --name "${{ env.ACR_NAME }}"
+
+      # Build the image (always) — validates Dockerfile on PRs
+      - name: Build Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          # Load into local Docker daemon for vulnerability scanning
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Build args for provenance metadata
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+
+      # Scan BEFORE pushing — catch vulnerabilities before they reach registry
+      - name: Trivy Vulnerability Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:sha-${{ github.sha }}"
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+          # Don't fail on HIGH in non-main branches to avoid blocking development
+          exit-code: ${{ github.ref == 'refs/heads/main' && '1' || '0' }}
+
+      # Upload scan results to GitHub Security tab for visibility
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()  # Upload even if scan finds vulnerabilities
+        with:
+          sarif_file: "trivy-results.sarif"
+
+      # Push only on main branch merge — PRs only build and scan
+      - name: Push to ACR
+        id: push
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          # Provenance attestation for supply chain security (SLSA Level 2)
+          provenance: true
+
+      # Output a deployment summary for downstream jobs
+      - name: Deployment Summary
+        if: github.ref == 'refs/heads/main'
+        run: |
+          echo "### 🐳 Docker Image Published" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Property | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Registry** | \`${{ env.ACR_NAME }}.azurecr.io\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Tags** | \`${{ steps.meta.outputs.tags }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Digest** | \`${{ steps.push.outputs.digest }}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Deploy to AKS (only after successful push on main)
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: "Deploy to AKS (Dev)"
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: dev
+      url: https://dev.example.com
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Get AKS credentials using OIDC-authenticated Azure CLI session
+      - name: Get AKS Credentials
+        run: |
+          az aks get-credentials \
+            --resource-group "${{ vars.AKS_RESOURCE_GROUP }}" \
+            --name "${{ vars.AKS_CLUSTER_NAME }}" \
+            --overwrite-existing
+
+      - name: Deploy to AKS
+        run: |
+          # Update the image tag in the Kubernetes manifest
+          IMAGE_TAG="${{ needs.build-and-push.outputs.image_tag }}"
+          kubectl set image deployment/${{ vars.APP_NAME }} \
+            app="${{ env.IMAGE_NAME }}:${IMAGE_TAG}" \
+            --namespace="${{ vars.K8S_NAMESPACE }}"
+
+          # Wait for rollout to complete — fail fast on deployment issues
+          kubectl rollout status deployment/${{ vars.APP_NAME }} \
+            --namespace="${{ vars.K8S_NAMESPACE }}" \
+            --timeout=300s
