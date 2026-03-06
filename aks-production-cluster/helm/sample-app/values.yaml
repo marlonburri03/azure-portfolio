@@ -1,0 +1,89 @@
+# --------------------------------------------------------------------------
+# Application
+# --------------------------------------------------------------------------
+replicaCount: 2
+
+image:
+  repository: mcr.microsoft.com/azuredocs/aks-helloworld
+  tag: "v1"
+  pullPolicy: IfNotPresent
+
+# --------------------------------------------------------------------------
+# Service Account — annotated for Workload Identity
+# --------------------------------------------------------------------------
+serviceAccount:
+  create: true
+  name: sample-app-sa
+  annotations:
+    # This client ID maps the K8s SA to an Azure Managed Identity via
+    # federated credentials — no secrets are mounted into the pod.
+    azure.workload.identity/client-id: "<WORKLOAD_IDENTITY_CLIENT_ID>"
+
+# --------------------------------------------------------------------------
+# Container
+# --------------------------------------------------------------------------
+containerPort: 80
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# --------------------------------------------------------------------------
+# Service
+# --------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 80
+
+# --------------------------------------------------------------------------
+# Ingress — AGIC annotations for Application Gateway
+# --------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: azure-application-gateway
+  annotations:
+    # Force HTTPS — Application Gateway redirects HTTP to HTTPS
+    appgw.ingress.kubernetes.io/ssl-redirect: "true"
+    # Health probe path used by Application Gateway to check backend health
+    appgw.ingress.kubernetes.io/health-probe-path: "/healthz"
+    # WAF policy reference (managed outside of Helm for shared use)
+    appgw.ingress.kubernetes.io/waf-policy-for-path: ""
+  hosts:
+    - host: sample-app.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: sample-app-tls
+      hosts:
+        - sample-app.example.com
+
+# --------------------------------------------------------------------------
+# Pod Disruption Budget — maintain availability during rollouts
+# --------------------------------------------------------------------------
+podDisruptionBudget:
+  minAvailable: 1
+
+# --------------------------------------------------------------------------
+# Tolerations — schedule on the workload node pool
+# --------------------------------------------------------------------------
+tolerations:
+  - key: workload
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+
+nodeSelector:
+  nodepool: workload
+
+# --------------------------------------------------------------------------
+# Labels & Annotations
+# --------------------------------------------------------------------------
+podLabels:
+  azure.workload.identity/use: "true"
+
+podAnnotations: {}

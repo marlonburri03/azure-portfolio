@@ -1,0 +1,83 @@
+// =============================================================================
+// VM Performance — CPU, Memory, Disk, and Availability
+// =============================================================================
+
+// --- CPU saturation across fleet ---------------------------------------------
+// Identifies VMs running hot (>80% avg CPU over 30 minutes). Sustained high CPU
+// usually means the VM is undersized or a process is runaway.
+Perf
+| where TimeGenerated > ago(1h)
+| where ObjectName == "Processor" and CounterName == "% Processor Time" and InstanceName == "_Total"
+| summarize AvgCPU = avg(CounterValue), P95CPU = percentile(CounterValue, 95) by Computer, bin(TimeGenerated, 30m)
+| where AvgCPU > 80
+| order by AvgCPU desc
+| project Computer, TimeGenerated, AvgCPU = round(AvgCPU, 1), P95CPU = round(P95CPU, 1)
+
+// --- Available memory trending -----------------------------------------------
+// Tracks available MB over time. A steady downward trend suggests a memory leak;
+// a sudden drop suggests a burst workload or fork bomb.
+Perf
+| where TimeGenerated > ago(6h)
+| where ObjectName == "Memory" and CounterName == "Available MBytes"
+| summarize AvailableMB = avg(CounterValue) by Computer, bin(TimeGenerated, 10m)
+| render timechart
+
+// --- Low memory VMs (< 10% free) --------------------------------------------
+// VMs below 10% available memory are at risk of OOM kills by the OS.
+// This is the "should we page someone?" query.
+Perf
+| where TimeGenerated > ago(30m)
+| where ObjectName == "Memory" and CounterName == "% Used Memory"
+| summarize AvgUsedPct = avg(CounterValue) by Computer
+| where AvgUsedPct > 90
+| order by AvgUsedPct desc
+| project Computer, MemoryUsedPct = round(AvgUsedPct, 1)
+
+// --- Disk IOPS and latency bottlenecks ---------------------------------------
+// High disk latency (>20ms average) on a VM usually indicates storage throttling
+// or an undersized disk tier. Check if the VM is hitting the IOPS cap.
+Perf
+| where TimeGenerated > ago(1h)
+| where ObjectName == "LogicalDisk" and CounterName == "Avg. Disk sec/Transfer" and InstanceName != "_Total"
+| summarize
+    AvgLatencyMs = avg(CounterValue) * 1000,
+    P99LatencyMs = percentile(CounterValue, 99) * 1000
+    by Computer, InstanceName, bin(TimeGenerated, 10m)
+| where AvgLatencyMs > 20
+| order by AvgLatencyMs desc
+| project Computer, Disk = InstanceName, TimeGenerated,
+    AvgLatencyMs = round(AvgLatencyMs, 2), P99LatencyMs = round(P99LatencyMs, 2)
+
+// --- Disk space critical (< 10% free) ----------------------------------------
+Perf
+| where TimeGenerated > ago(30m)
+| where ObjectName == "LogicalDisk" and CounterName == "% Free Space" and InstanceName != "_Total"
+| summarize FreeSpacePct = avg(CounterValue) by Computer, InstanceName
+| where FreeSpacePct < 10
+| order by FreeSpacePct asc
+| project Computer, Disk = InstanceName, FreeSpacePct = round(FreeSpacePct, 1)
+
+// --- Heartbeat gap detection -------------------------------------------------
+// Finds VMs that were reporting but have gone silent. A gap >10 minutes is
+// suspicious; >30 minutes almost certainly means the VM is down or disconnected.
+let known_vms = Heartbeat
+    | where TimeGenerated > ago(24h)
+    | distinct Computer;
+let recently_seen = Heartbeat
+    | where TimeGenerated > ago(10m)
+    | distinct Computer;
+known_vms
+| join kind=leftanti recently_seen on Computer
+| project MissingVM = Computer
+
+// --- Network bytes per VM (top talkers) --------------------------------------
+// Identifies VMs pushing the most network traffic, which helps with bandwidth
+// planning and spotting unexpected data exfiltration patterns.
+Perf
+| where TimeGenerated > ago(1h)
+| where ObjectName == "Network" and CounterName == "Total Bytes Transmitted"
+| summarize TotalBytesTx = sum(CounterValue) by Computer
+| order by TotalBytesTx desc
+| take 10
+| extend TotalGB = round(TotalBytesTx / (1024 * 1024 * 1024), 2)
+| project Computer, TotalGB

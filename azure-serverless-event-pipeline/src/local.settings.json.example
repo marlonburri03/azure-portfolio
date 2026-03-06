@@ -1,0 +1,15 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "SERVICE_BUS_NAMESPACE": "<your-service-bus-namespace>",
+    "SERVICE_BUS_QUEUE_NAME": "events-queue",
+    "SERVICE_BUS_CONNECTION": "<identity-based-connection-or-connection-string>",
+    "COSMOS_DB_ENDPOINT": "https://<your-cosmos-account>.documents.azure.com:443/",
+    "COSMOS_DB_DATABASE": "events-db",
+    "COSMOS_DB_CONTAINER": "processed-events",
+    "STORAGE_CONNECTION": "UseDevelopmentStorage=true",
+    "APPINSIGHTS_INSTRUMENTATIONKEY": "<your-instrumentation-key>"
+  }
+}

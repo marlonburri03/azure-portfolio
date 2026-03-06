@@ -1,0 +1,311 @@
+# =============================================================================
+# Terraform Plan & Apply with OIDC Authentication
+# =============================================================================
+# Uses GitHub OIDC federation to authenticate with Azure — no stored secrets.
+# Posts the terraform plan output as a PR comment for human review before apply.
+# Apply only runs on merge to main, ensuring plan was reviewed.
+# =============================================================================
+
+name: "Terraform Plan & Apply"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infrastructure/**"
+      - ".github/workflows/terraform-plan-apply.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "infrastructure/**"
+      - ".github/workflows/terraform-plan-apply.yml"
+
+# Cancel in-progress runs for the same PR to save costs
+concurrency:
+  group: terraform-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# OIDC requires id-token write to request JWT from GitHub's OIDC provider
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write  # Required to post PR comments with plan output
+
+env:
+  TF_VERSION: "1.7.5"
+  TF_WORKING_DIR: "infrastructure"
+  # ARM environment variables consumed by the azurerm provider
+  ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_USE_OIDC: "true"  # Tells azurerm provider to use OIDC instead of client secret
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Validate: fast feedback on syntax and formatting errors
+  # ---------------------------------------------------------------------------
+  validate:
+    name: "Validate & Lint"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive -diff
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        # Fail loudly on formatting issues — enforces consistent style
+        continue-on-error: false
+
+      - name: Terraform Init
+        id: init
+        run: terraform init -backend=false
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+  # ---------------------------------------------------------------------------
+  # Plan: generates the execution plan and posts it as a PR comment
+  # ---------------------------------------------------------------------------
+  plan:
+    name: "Terraform Plan"
+    runs-on: ubuntu-latest
+    needs: validate
+    # Plan runs on PRs to give reviewers visibility into what will change
+    if: github.event_name == 'pull_request'
+    outputs:
+      plan_exitcode: ${{ steps.plan.outputs.exitcode }}
+    env:
+      # Each environment gets its own state file and variable set
+      TF_WORKSPACE: "dev"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: true  # Wraps terraform to capture stdout/stderr
+
+      # OIDC login — exchanges GitHub JWT for an Azure access token
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        id: init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_SA }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=${{ env.TF_WORKSPACE }}.terraform.tfstate"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -no-color \
+            -detailed-exitcode \
+            -var-file="environments/${{ env.TF_WORKSPACE }}.tfvars" \
+            -out=tfplan \
+            2>&1 | tee plan_output.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        # Exit code 2 = changes present (not an error)
+        continue-on-error: true
+
+      # Post the plan as a PR comment so reviewers can see exactly what changes
+      - name: Post Plan to PR
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        env:
+          PLAN_OUTPUT: ${{ steps.plan.outputs.stdout }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `### Terraform Plan 📋
+            **Environment:** \`${{ env.TF_WORKSPACE }}\`
+            **Working Directory:** \`${{ env.TF_WORKING_DIR }}\`
+
+            <details><summary>Show Plan Output</summary>
+
+            \`\`\`hcl
+            ${process.env.PLAN_OUTPUT}
+            \`\`\`
+
+            </details>
+
+            *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+            // Find and update existing comment to avoid PR clutter
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const botComment = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('Terraform Plan 📋')
+            );
+
+            const body = output.substring(0, 65536); // GitHub comment size limit
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Fail on Plan Error
+        if: steps.plan.outputs.exitcode == '1'
+        run: exit 1
+
+  # ---------------------------------------------------------------------------
+  # Apply: runs only on main after PR merge — deploys to each environment
+  # ---------------------------------------------------------------------------
+  apply-dev:
+    name: "Apply → Dev"
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: dev
+    env:
+      TF_WORKSPACE: "dev"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_SA }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=${{ env.TF_WORKSPACE }}.terraform.tfstate"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Apply
+        run: |
+          terraform apply \
+            -auto-approve \
+            -var-file="environments/${{ env.TF_WORKSPACE }}.tfvars" \
+            -no-color
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+  apply-staging:
+    name: "Apply → Staging"
+    runs-on: ubuntu-latest
+    needs: apply-dev
+    environment:
+      name: staging  # GitHub Environment with required reviewers acts as approval gate
+    env:
+      TF_WORKSPACE: "staging"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_SA }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=${{ env.TF_WORKSPACE }}.terraform.tfstate"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Apply
+        run: |
+          terraform apply \
+            -auto-approve \
+            -var-file="environments/${{ env.TF_WORKSPACE }}.tfvars" \
+            -no-color
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+  apply-prod:
+    name: "Apply → Production"
+    runs-on: ubuntu-latest
+    needs: apply-staging
+    environment:
+      name: production  # Strictest protection rules: 2 reviewers + deployment window
+    env:
+      TF_WORKSPACE: "prod"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_SA }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=${{ env.TF_WORKSPACE }}.terraform.tfstate"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Apply
+        run: |
+          terraform apply \
+            -auto-approve \
+            -var-file="environments/${{ env.TF_WORKSPACE }}.tfvars" \
+            -no-color
+        working-directory: ${{ env.TF_WORKING_DIR }}

@@ -1,0 +1,115 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Deploy — Terraform plan / apply for cost-governance infrastructure
+# ──────────────────────────────────────────────────────────────────────────────
+# Uses OIDC (federated credentials) so no client secrets are stored in GitHub.
+
+name: "Deploy Cost Governance"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "azure-cost-governance/infra/**"
+      - "azure-cost-governance/policies/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "azure-cost-governance/infra/**"
+      - "azure-cost-governance/policies/**"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - prod
+
+# OIDC requires these permissions to request the JWT from GitHub's token endpoint.
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_VERSION: "1.5.7"
+  WORKING_DIR: "azure-cost-governance/infra"
+
+jobs:
+  # ── Plan ──────────────────────────────────────────────────────────────────
+  plan:
+    name: "Terraform Plan"
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.WORKING_DIR }}
+        run: terraform init -input=false
+
+      - name: Terraform Plan
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          terraform plan \
+            -var-file="../environments/${{ github.event.inputs.environment || 'dev' }}.tfvars" \
+            -out=tfplan \
+            -input=false
+
+      # Upload the plan so the apply job can consume it without re-planning.
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.WORKING_DIR }}/tfplan
+
+  # ── Apply (main branch only) ─────────────────────────────────────────────
+  apply:
+    name: "Terraform Apply"
+    needs: plan
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.WORKING_DIR }}
+        run: terraform init -input=false
+
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.WORKING_DIR }}
+
+      - name: Terraform Apply
+        working-directory: ${{ env.WORKING_DIR }}
+        run: terraform apply -input=false -auto-approve tfplan

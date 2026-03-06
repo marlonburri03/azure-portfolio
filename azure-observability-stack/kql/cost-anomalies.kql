@@ -1,0 +1,85 @@
+// =============================================================================
+// Cost Anomalies — Spend Deviation, Resource Group Spikes, Idle Resources
+// =============================================================================
+// These queries use the AzureCostManagement (Usage) table available when
+// Cost Management data is exported to a Log Analytics workspace.
+
+// --- Daily spend deviation ---------------------------------------------------
+// Compares each day's spend against the 7-day moving average. A deviation of
+// >30% is flagged. This catches unexpected scaling events, new resources
+// accidentally left running, or pricing-tier changes.
+AzureCostManagement
+| where TimeGenerated > ago(30d)
+| summarize DailyCost = sum(CostInBillingCurrency) by Day = bin(TimeGenerated, 1d)
+| order by Day asc
+| serialize
+| extend MovingAvg7d = (prev(DailyCost, 1) + prev(DailyCost, 2) + prev(DailyCost, 3)
+    + prev(DailyCost, 4) + prev(DailyCost, 5) + prev(DailyCost, 6) + prev(DailyCost, 7)) / 7.0
+| where isnotnull(MovingAvg7d)
+| extend DeviationPct = round(100.0 * (DailyCost - MovingAvg7d) / MovingAvg7d, 1)
+| where abs(DeviationPct) > 30
+| project Day, DailyCost = round(DailyCost, 2), MovingAvg7d = round(MovingAvg7d, 2), DeviationPct
+
+// --- Resource group cost spikes (week-over-week) -----------------------------
+// Ranks resource groups by week-over-week cost growth to spot the source of
+// an overall spend increase. Useful during cost review meetings.
+let this_week = AzureCostManagement
+    | where TimeGenerated > ago(7d)
+    | summarize ThisWeekCost = sum(CostInBillingCurrency) by ResourceGroupName;
+let last_week = AzureCostManagement
+    | where TimeGenerated between (ago(14d) .. ago(7d))
+    | summarize LastWeekCost = sum(CostInBillingCurrency) by ResourceGroupName;
+this_week
+| join kind=inner last_week on ResourceGroupName
+| extend GrowthPct = round(100.0 * (ThisWeekCost - LastWeekCost) / LastWeekCost, 1)
+| where GrowthPct > 20 and ThisWeekCost > 10
+| order by GrowthPct desc
+| project ResourceGroupName,
+    ThisWeekCost = round(ThisWeekCost, 2),
+    LastWeekCost = round(LastWeekCost, 2),
+    GrowthPct
+
+// --- Top 10 most expensive resources -----------------------------------------
+// Simple but essential: which individual resources are costing the most today?
+AzureCostManagement
+| where TimeGenerated > ago(7d)
+| summarize TotalCost = sum(CostInBillingCurrency) by ResourceId, ResourceType, ResourceGroupName
+| order by TotalCost desc
+| take 10
+| extend TotalCost = round(TotalCost, 2)
+| project ResourceGroupName, ResourceType, ResourceId, TotalCost
+
+// --- Idle VM detection -------------------------------------------------------
+// Cross-references cost data with performance data to find VMs that are running
+// (and costing money) but have near-zero CPU utilization — strong candidates
+// for deallocation or Reserved Instance conversion.
+let idle_vms = Perf
+    | where TimeGenerated > ago(7d)
+    | where ObjectName == "Processor" and CounterName == "% Processor Time" and InstanceName == "_Total"
+    | summarize AvgCPU = avg(CounterValue), MaxCPU = max(CounterValue) by Computer
+    | where AvgCPU < 5 and MaxCPU < 20;
+AzureCostManagement
+| where TimeGenerated > ago(7d)
+| where ResourceType == "microsoft.compute/virtualmachines"
+| summarize WeeklyCost = sum(CostInBillingCurrency) by ResourceId
+| extend VMName = tostring(split(ResourceId, "/")[-1])
+| join kind=inner idle_vms on $left.VMName == $right.Computer
+| project VMName, WeeklyCost = round(WeeklyCost, 2), AvgCPU = round(AvgCPU, 1), MaxCPU = round(MaxCPU, 1)
+| order by WeeklyCost desc
+
+// --- Unattached managed disks ------------------------------------------------
+// Disks left behind after VM deletion keep accruing charges. This query finds
+// them by checking for disks with no associated VM in the resource graph data.
+AzureActivity
+| where TimeGenerated > ago(30d)
+| where OperationNameValue == "Microsoft.Compute/disks/write"
+| join kind=leftanti (
+    AzureActivity
+    | where TimeGenerated > ago(30d)
+    | where OperationNameValue has "virtualMachines" and OperationNameValue has "write"
+    | extend DiskRef = tostring(parse_json(Properties).responseBody)
+    | where DiskRef has "disk"
+    | distinct DiskRef
+) on $left.ResourceId == $right.DiskRef
+| distinct ResourceId, ResourceGroup
+| take 20

@@ -1,0 +1,12 @@
+{
+  "scriptFile": "__init__.py",
+  "bindings": [
+    {
+      "type": "blobTrigger",
+      "name": "blob",
+      "direction": "in",
+      "path": "raw-uploads/{name}",
+      "connection": "STORAGE_CONNECTION"
+    }
+  ]
+}

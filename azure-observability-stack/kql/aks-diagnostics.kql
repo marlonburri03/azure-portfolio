@@ -1,0 +1,72 @@
+// =============================================================================
+// AKS Diagnostics — Control Plane & Workload Health
+// =============================================================================
+
+// --- Control plane API server errors -----------------------------------------
+// Surfaces 4xx/5xx responses from the Kubernetes API server, grouped by verb
+// and resource type. A spike here usually indicates RBAC misconfigurations,
+// webhook failures, or etcd pressure.
+AzureDiagnostics
+| where Category == "kube-apiserver"
+| where log_s has "HTTP" and log_s has_any ("4", "5")
+| parse log_s with * "verb=" Verb " " * "resource=" Resource " " *
+    "code=" StatusCode " " *
+| where StatusCode startswith "4" or StatusCode startswith "5"
+| summarize ErrorCount = count() by Verb, Resource, StatusCode, bin(TimeGenerated, 5m)
+| order by ErrorCount desc
+| render timechart
+
+// --- Pod restart storm detection ---------------------------------------------
+// Finds pods whose restart count jumped significantly in the last hour.
+// Helps catch CrashLoopBackOff before it triggers a paging alert.
+KubePodInventory
+| where TimeGenerated > ago(1h)
+| where PodRestartCount > 0
+| summarize
+    MinRestarts = min(PodRestartCount),
+    MaxRestarts = max(PodRestartCount)
+    by PodName, Namespace, ClusterName
+| extend RestartDelta = MaxRestarts - MinRestarts
+| where RestartDelta >= 3
+| order by RestartDelta desc
+| project ClusterName, Namespace, PodName, RestartDelta, MaxRestarts
+
+// --- OOMKilled containers ----------------------------------------------------
+// Containers killed by the OOM killer indicate memory limits set too low
+// or genuine memory leaks. This is the first query to run after a pod restart.
+ContainerInventory
+| where TimeGenerated > ago(6h)
+| where ContainerState == "Terminated" and ExitCode == 137
+| join kind=inner (
+    KubePodInventory
+    | where TimeGenerated > ago(6h)
+    | distinct ContainerID, PodName, Namespace, ClusterName
+) on ContainerID
+| summarize OOMCount = count() by ClusterName, Namespace, PodName, ContainerName
+| order by OOMCount desc
+
+// --- Node conditions (pressure & not ready) ----------------------------------
+// NotReady or pressure conditions on nodes indicate infrastructure problems.
+// Sustained MemoryPressure often precedes widespread OOM kills.
+KubeNodeInventory
+| where TimeGenerated > ago(30m)
+| where Status != "Ready"
+| summarize arg_max(TimeGenerated, *) by ClusterName, Computer
+| project
+    TimeGenerated,
+    ClusterName,
+    Node = Computer,
+    Status,
+    KubeletVersion,
+    KubeProxyVersion
+
+// --- Container CPU throttling ------------------------------------------------
+// High CPU throttling means containers are hitting their CPU limits frequently.
+// Consider increasing limits or switching to burstable VM SKUs.
+Perf
+| where TimeGenerated > ago(1h)
+| where ObjectName == "K8SContainer" and CounterName == "cpuThrottledPercentage"
+| summarize AvgThrottled = avg(CounterValue) by InstanceName, bin(TimeGenerated, 5m)
+| where AvgThrottled > 25
+| order by AvgThrottled desc
+| render timechart
