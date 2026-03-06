@@ -45,9 +45,11 @@ resource "azurerm_role_assignment" "platform_reader" {
 # ── RBAC — Network Contributor on connectivity RG ────────────────────────────
 # The platform identity needs to manage peering and route tables. Scoping
 # the role to the connectivity resource group avoids over-privileging.
+# The resource group ID is passed in from the connectivity module output to
+# create an explicit dependency.
 
 resource "azurerm_role_assignment" "platform_network_contributor" {
-  scope                = "/subscriptions/${data.azurerm_subscription.current.subscription_id}/resourceGroups/rg-connectivity-${var.environment}"
+  scope                = var.connectivity_resource_group_id
   role_definition_name = "Network Contributor"
   principal_id         = azurerm_user_assigned_identity.platform.principal_id
 

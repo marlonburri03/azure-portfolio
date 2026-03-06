@@ -170,7 +170,7 @@ resource "azurerm_virtual_network_peering" "spoke_to_hub" {
   for_each = var.spoke_vnets
 
   name                         = "peer-${each.key}-to-hub"
-  resource_group_name          = each.value.resource_group_name
+  resource_group_name          = azurerm_resource_group.spokes[each.key].name
   virtual_network_name         = azurerm_virtual_network.spokes[each.key].name
   remote_virtual_network_id    = azurerm_virtual_network.hub.id
   allow_forwarded_traffic      = true
@@ -178,13 +178,22 @@ resource "azurerm_virtual_network_peering" "spoke_to_hub" {
   allow_virtual_network_access = true
 }
 
+# Spoke resource groups — each spoke gets its own RG for clear RBAC boundaries.
+resource "azurerm_resource_group" "spokes" {
+  for_each = var.spoke_vnets
+
+  name     = each.value.resource_group_name
+  location = var.location
+  tags     = var.common_tags
+}
+
 # Spoke VNets — created alongside the hub so peering can reference them.
 resource "azurerm_virtual_network" "spokes" {
   for_each = var.spoke_vnets
 
   name                = "vnet-${each.key}-${var.environment}"
-  location            = azurerm_resource_group.connectivity.location
-  resource_group_name = each.value.resource_group_name
+  location            = azurerm_resource_group.spokes[each.key].location
+  resource_group_name = azurerm_resource_group.spokes[each.key].name
   address_space       = each.value.address_space
   tags                = var.common_tags
 }

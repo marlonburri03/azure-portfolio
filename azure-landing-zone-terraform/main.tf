@@ -63,8 +63,9 @@ module "connectivity" {
 module "identity" {
   source = "./modules/identity"
 
-  location               = var.location
-  environment            = var.environment
-  platform_identity_name = var.platform_identity_name
-  common_tags            = local.common_tags
+  location                        = var.location
+  environment                     = var.environment
+  platform_identity_name          = var.platform_identity_name
+  connectivity_resource_group_id  = module.connectivity.connectivity_resource_group_id
+  common_tags                     = local.common_tags
 }
