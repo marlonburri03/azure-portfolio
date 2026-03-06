@@ -1,0 +1,208 @@
+# =============================================================================
+# Azure Bicep Deployment Pipeline
+# =============================================================================
+# Deploys Azure infrastructure using Bicep templates as an alternative to
+# Terraform. Uses what-if for plan preview, validation before deploy, and
+# OIDC federated credentials for passwordless authentication.
+# =============================================================================
+
+name: "Bicep Deploy"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "bicep/**"
+      - ".github/workflows/bicep-deploy.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "bicep/**"
+
+concurrency:
+  group: bicep-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  BICEP_DIR: "bicep"
+  LOCATION: "eastus2"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Validate: lint and preflight check the Bicep templates
+  # ---------------------------------------------------------------------------
+  validate:
+    name: "Validate Bicep"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Bicep CLI is pre-installed on GitHub-hosted runners via Azure CLI
+      - name: Bicep Build (Lint)
+        run: |
+          # 'bicep build' compiles .bicep to ARM JSON and surfaces lint errors
+          for file in ${{ env.BICEP_DIR }}/*.bicep; do
+            echo "::group::Linting $(basename "$file")"
+            az bicep build --file "$file" --stdout > /dev/null
+            echo "::endgroup::"
+          done
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Preflight validation catches errors Azure would reject at deploy time
+      - name: Preflight Validation
+        run: |
+          az deployment sub validate \
+            --location "${{ env.LOCATION }}" \
+            --template-file "${{ env.BICEP_DIR }}/main.bicep" \
+            --parameters "${{ env.BICEP_DIR }}/parameters/dev.bicepparam" \
+            --name "validate-${{ github.run_id }}"
+
+  # ---------------------------------------------------------------------------
+  # What-If: preview changes and post to PR (Bicep equivalent of terraform plan)
+  # ---------------------------------------------------------------------------
+  what-if:
+    name: "What-If Analysis"
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # What-if shows what Azure WOULD change without actually deploying
+      - name: Run What-If
+        id: whatif
+        run: |
+          RESULT=$(az deployment sub what-if \
+            --location "${{ env.LOCATION }}" \
+            --template-file "${{ env.BICEP_DIR }}/main.bicep" \
+            --parameters "${{ env.BICEP_DIR }}/parameters/dev.bicepparam" \
+            --name "whatif-${{ github.run_id }}" \
+            --no-pretty-print 2>&1) || true
+          # Escape multiline output for GitHub Actions
+          echo "output<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$RESULT" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Post What-If to PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `### Bicep What-If Analysis 🔍
+            **Location:** \`${{ env.LOCATION }}\`
+
+            <details><summary>Show What-If Output</summary>
+
+            \`\`\`
+            ${{ steps.whatif.outputs.output }}
+            \`\`\`
+
+            </details>
+
+            *Pushed by: @${{ github.actor }}*`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: output.substring(0, 65536),
+            });
+
+  # ---------------------------------------------------------------------------
+  # Deploy: progressive rollout through environments
+  # ---------------------------------------------------------------------------
+  deploy-dev:
+    name: "Deploy → Dev"
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy Bicep
+        run: |
+          az deployment sub create \
+            --location "${{ env.LOCATION }}" \
+            --template-file "${{ env.BICEP_DIR }}/main.bicep" \
+            --parameters "${{ env.BICEP_DIR }}/parameters/dev.bicepparam" \
+            --name "deploy-dev-${{ github.run_id }}"
+
+  deploy-staging:
+    name: "Deploy → Staging"
+    runs-on: ubuntu-latest
+    needs: deploy-dev
+    environment:
+      name: staging
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy Bicep
+        run: |
+          az deployment sub create \
+            --location "${{ env.LOCATION }}" \
+            --template-file "${{ env.BICEP_DIR }}/main.bicep" \
+            --parameters "${{ env.BICEP_DIR }}/parameters/staging.bicepparam" \
+            --name "deploy-staging-${{ github.run_id }}"
+
+  deploy-prod:
+    name: "Deploy → Production"
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    environment:
+      name: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy Bicep
+        run: |
+          az deployment sub create \
+            --location "${{ env.LOCATION }}" \
+            --template-file "${{ env.BICEP_DIR }}/main.bicep" \
+            --parameters "${{ env.BICEP_DIR }}/parameters/prod.bicepparam" \
+            --name "deploy-prod-${{ github.run_id }}"

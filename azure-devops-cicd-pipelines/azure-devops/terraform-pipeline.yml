@@ -1,0 +1,160 @@
+# =============================================================================
+# Azure DevOps — Multi-Stage Terraform Pipeline
+# =============================================================================
+# Deploys infrastructure through dev → staging → prod with manual approval
+# gates between environments. Uses Workload Identity Federation (OIDC) via
+# Azure DevOps service connections — no service principal secrets stored.
+#
+# Pipeline structure:
+#   1. Validate & Security Scan  (every run)
+#   2. Plan + Apply → Dev        (auto on main)
+#   3. Plan + Apply → Staging    (manual approval gate)
+#   4. Plan + Apply → Production (manual approval gate + business hours check)
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - infrastructure/**
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - infrastructure/**
+
+# Pool defaults — override per-stage if needed
+pool:
+  vmImage: "ubuntu-latest"
+
+variables:
+  - name: TF_VERSION
+    value: "1.7.5"
+  - name: TF_WORKING_DIR
+    value: "infrastructure"
+  # Suppress Terraform CLI color codes in pipeline logs
+  - name: TF_IN_AUTOMATION
+    value: "true"
+
+# Variable groups contain per-environment secrets and config
+# Created in Azure DevOps Library, linked to Azure Key Vault
+# Uses Workload Identity Federation — no client secrets
+stages:
+  # ===========================================================================
+  # Stage 1: Validate — fast feedback on syntax, format, and security
+  # ===========================================================================
+  - stage: Validate
+    displayName: "🔍 Validate & Security Scan"
+    jobs:
+      - job: ValidateTerraform
+        displayName: "Terraform Validate"
+        steps:
+          - task: TerraformInstaller@1
+            displayName: "Install Terraform ${{ variables.TF_VERSION }}"
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          - script: terraform fmt -check -recursive -diff
+            displayName: "Check Formatting"
+            workingDirectory: $(TF_WORKING_DIR)
+
+          - script: terraform init -backend=false
+            displayName: "Init (validation only)"
+            workingDirectory: $(TF_WORKING_DIR)
+
+          - script: terraform validate -no-color
+            displayName: "Validate Configuration"
+            workingDirectory: $(TF_WORKING_DIR)
+
+      # Run security scans in parallel with validation for faster feedback
+      - template: templates/security-scan.yml
+        parameters:
+          workingDirectory: $(TF_WORKING_DIR)
+
+  # ===========================================================================
+  # Stage 2: Dev — auto-deploys on merge to main
+  # ===========================================================================
+  - stage: Dev
+    displayName: "🚀 Dev Environment"
+    dependsOn: Validate
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    variables:
+      - group: terraform-dev  # Links to Azure DevOps variable group
+    jobs:
+      - template: templates/terraform-plan.yml
+        parameters:
+          environment: dev
+          # Service connection uses Workload Identity Federation
+          serviceConnection: "azure-dev-oidc"
+          workingDirectory: $(TF_WORKING_DIR)
+          backendResourceGroup: $(TF_STATE_RG)
+          backendStorageAccount: $(TF_STATE_SA)
+          backendContainer: "tfstate"
+          backendKey: "dev.terraform.tfstate"
+
+      - template: templates/terraform-apply.yml
+        parameters:
+          environment: dev
+          serviceConnection: "azure-dev-oidc"
+          workingDirectory: $(TF_WORKING_DIR)
+          dependsOn: Plan
+
+  # ===========================================================================
+  # Stage 3: Staging — requires manual approval
+  # ===========================================================================
+  - stage: Staging
+    displayName: "🔶 Staging Environment"
+    dependsOn: Dev
+    condition: succeeded()
+    variables:
+      - group: terraform-staging
+    jobs:
+      - template: templates/terraform-plan.yml
+        parameters:
+          environment: staging
+          serviceConnection: "azure-staging-oidc"
+          workingDirectory: $(TF_WORKING_DIR)
+          backendResourceGroup: $(TF_STATE_RG)
+          backendStorageAccount: $(TF_STATE_SA)
+          backendContainer: "tfstate"
+          backendKey: "staging.terraform.tfstate"
+
+      # deployment job with environment triggers Azure DevOps approval checks
+      - template: templates/terraform-apply.yml
+        parameters:
+          environment: staging
+          serviceConnection: "azure-staging-oidc"
+          workingDirectory: $(TF_WORKING_DIR)
+          dependsOn: Plan
+
+  # ===========================================================================
+  # Stage 4: Production — strictest approval gates
+  # ===========================================================================
+  - stage: Production
+    displayName: "🏭 Production Environment"
+    dependsOn: Staging
+    condition: succeeded()
+    variables:
+      - group: terraform-prod
+    jobs:
+      - template: templates/terraform-plan.yml
+        parameters:
+          environment: prod
+          serviceConnection: "azure-prod-oidc"
+          workingDirectory: $(TF_WORKING_DIR)
+          backendResourceGroup: $(TF_STATE_RG)
+          backendStorageAccount: $(TF_STATE_SA)
+          backendContainer: "tfstate"
+          backendKey: "prod.terraform.tfstate"
+
+      - template: templates/terraform-apply.yml
+        parameters:
+          environment: prod
+          serviceConnection: "azure-prod-oidc"
+          workingDirectory: $(TF_WORKING_DIR)
+          dependsOn: Plan

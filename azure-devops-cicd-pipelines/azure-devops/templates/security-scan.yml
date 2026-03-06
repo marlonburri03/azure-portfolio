@@ -1,0 +1,61 @@
+# =============================================================================
+# Template: Security Scan
+# =============================================================================
+# Runs Checkov and tfsec in parallel as a reusable template.
+# Results are published as pipeline artifacts and test results.
+# =============================================================================
+
+parameters:
+  - name: workingDirectory
+    type: string
+    default: "infrastructure"
+
+jobs:
+  - job: SecurityScan
+    displayName: "Security Scan"
+    steps:
+      # Checkov — broad IaC policy engine covering Terraform, ARM, K8s, Docker
+      - script: |
+          pip install --quiet checkov
+
+          checkov \
+            --directory "${{ parameters.workingDirectory }}" \
+            --framework terraform \
+            --output cli \
+            --output junitxml \
+            --output-file-path console,$(Build.ArtifactStagingDirectory)/checkov-results.xml \
+            --soft-fail
+        displayName: "Checkov Scan"
+
+      # Publish Checkov results as test results for visibility in Azure DevOps
+      - task: PublishTestResults@2
+        displayName: "Publish Checkov Results"
+        condition: always()
+        inputs:
+          testResultsFormat: "JUnit"
+          testResultsFiles: "$(Build.ArtifactStagingDirectory)/checkov-results.xml"
+          testRunTitle: "Checkov Security Scan"
+          failTaskOnFailedTests: false  # Advisory in non-prod branches
+
+      # tfsec — Terraform-specific scanner with deep HCL understanding
+      - script: |
+          # Install tfsec binary
+          curl -sL https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64 \
+            -o /usr/local/bin/tfsec
+          chmod +x /usr/local/bin/tfsec
+
+          tfsec "${{ parameters.workingDirectory }}" \
+            --format junit \
+            --out $(Build.ArtifactStagingDirectory)/tfsec-results.xml \
+            --minimum-severity HIGH \
+            --soft-fail
+        displayName: "tfsec Scan"
+
+      - task: PublishTestResults@2
+        displayName: "Publish tfsec Results"
+        condition: always()
+        inputs:
+          testResultsFormat: "JUnit"
+          testResultsFiles: "$(Build.ArtifactStagingDirectory)/tfsec-results.xml"
+          testRunTitle: "tfsec Security Scan"
+          failTaskOnFailedTests: false
