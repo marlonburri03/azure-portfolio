@@ -27,3 +27,8 @@ output "spoke_vnet_ids" {
   description = "Map of spoke names to their VNet resource IDs."
   value       = { for k, v in azurerm_virtual_network.spokes : k => v.id }
 }
+
+output "connectivity_resource_group_id" {
+  description = "Resource ID of the connectivity resource group."
+  value       = azurerm_resource_group.connectivity.id
+}

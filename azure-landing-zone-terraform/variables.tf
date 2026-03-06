@@ -39,7 +39,7 @@ variable "owner" {
 }
 
 variable "cost_center" {
-  description = "Finance cost centre code applied to every resource."
+  description = "Finance cost center code applied to every resource."
   type        = string
   default     = "CC-1000"
 }
