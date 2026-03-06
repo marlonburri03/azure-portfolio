@@ -1,0 +1,86 @@
+// =============================================================================
+// App Service Errors — HTTP Errors, Latency, and Dependency Health
+// =============================================================================
+
+// --- HTTP 5xx error rate by host ---------------------------------------------
+// Calculates the server-error percentage per App Service hostname.
+// A rate above 1% on >50 requests is a reliable signal of a real problem.
+AppServiceHTTPLogs
+| where TimeGenerated > ago(6h)
+| summarize
+    TotalRequests  = count(),
+    ServerErrors   = countif(ScStatus >= 500),
+    ClientErrors   = countif(ScStatus >= 400 and ScStatus < 500)
+    by CsHost, bin(TimeGenerated, 15m)
+| extend
+    ServerErrorPct = round(100.0 * ServerErrors / TotalRequests, 2),
+    ClientErrorPct = round(100.0 * ClientErrors / TotalRequests, 2)
+| order by TimeGenerated desc
+| render timechart
+
+// --- Slowest endpoints (P95 latency) -----------------------------------------
+// Finds the endpoints with the highest P95 response times. Useful for
+// identifying performance regressions after a deployment.
+AppServiceHTTPLogs
+| where TimeGenerated > ago(1h) and ScStatus < 500
+| summarize
+    P50ms = percentile(TimeTaken, 50),
+    P95ms = percentile(TimeTaken, 95),
+    P99ms = percentile(TimeTaken, 99),
+    RequestCount = count()
+    by CsUriStem, CsMethod
+| where RequestCount > 10
+| order by P95ms desc
+| take 20
+| project CsMethod, Endpoint = CsUriStem, RequestCount,
+    P50ms = round(P50ms, 0), P95ms = round(P95ms, 0), P99ms = round(P99ms, 0)
+
+// --- Failed requests by exception type ---------------------------------------
+// Groups Application Insights exceptions by type and operation to highlight
+// the most impactful failures. ProblemId groups related exceptions.
+AppExceptions
+| where TimeGenerated > ago(6h)
+| summarize ExceptionCount = count() by ExceptionType, OperationName, ProblemId
+| order by ExceptionCount desc
+| take 25
+
+// --- Dependency call failures ------------------------------------------------
+// Surfaces external dependency failures (databases, APIs, caches).
+// A sudden spike here often explains a downstream-caused 5xx pattern.
+AppDependencies
+| where TimeGenerated > ago(1h) and Success == false
+| summarize
+    FailureCount = count(),
+    AvgDurationMs = avg(DurationMs)
+    by DependencyType = Type, Target, DependencyName = Name
+| order by FailureCount desc
+| take 20
+
+// --- HTTP status code distribution -------------------------------------------
+// Gives a quick summary of the status code mix over the last hour.
+// Healthy apps should be 95%+ 2xx; anything else warrants investigation.
+AppServiceHTTPLogs
+| where TimeGenerated > ago(1h)
+| extend StatusBucket = case(
+    ScStatus >= 200 and ScStatus < 300, "2xx",
+    ScStatus >= 300 and ScStatus < 400, "3xx",
+    ScStatus >= 400 and ScStatus < 500, "4xx",
+    ScStatus >= 500, "5xx",
+    "other")
+| summarize Count = count() by StatusBucket, CsHost
+| order by CsHost asc, StatusBucket asc
+
+// --- Cold start detection (consumption plan) ---------------------------------
+// Measures the gap between function invocations to detect cold starts.
+// Durations significantly above the p50 after an idle gap indicate cold start.
+AppRequests
+| where TimeGenerated > ago(6h)
+| where AppRoleName has "func"
+| summarize
+    P50Duration = percentile(DurationMs, 50),
+    P99Duration = percentile(DurationMs, 99),
+    MaxDuration = max(DurationMs),
+    InvocationCount = count()
+    by AppRoleName, OperationName, bin(TimeGenerated, 15m)
+| where P99Duration > 3 * P50Duration and P50Duration > 0
+| order by P99Duration desc
