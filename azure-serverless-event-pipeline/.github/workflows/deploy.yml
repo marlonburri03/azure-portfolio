@@ -1,0 +1,179 @@
+# ---------------------------------------------------------------------------
+# GitHub Actions — Deploy Serverless Event Pipeline
+# ---------------------------------------------------------------------------
+# This workflow uses OIDC federation (no stored secrets) to authenticate with
+# Azure and deploys infrastructure via Terraform + the Function App code.
+#
+# Trigger:
+#   - Pull requests:  terraform plan (read-only, comment on PR)
+#   - Push to main:   terraform apply + Function App deployment
+# ---------------------------------------------------------------------------
+
+name: Deploy Serverless Event Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "azure-serverless-event-pipeline/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "azure-serverless-event-pipeline/**"
+
+# Only one deployment at a time per environment to prevent state conflicts.
+concurrency:
+  group: deploy-event-pipeline-${{ github.ref }}
+  cancel-in-progress: false
+
+# Minimal permissions — OIDC requires id-token: write.
+permissions:
+  id-token: write   # Required for Azure OIDC login
+  contents: read     # Required to checkout the repository
+  pull-requests: write # Required to comment terraform plan on PRs
+
+env:
+  WORKING_DIR: azure-serverless-event-pipeline
+  TF_DIR: azure-serverless-event-pipeline/infra
+  FUNC_DIR: azure-serverless-event-pipeline/src
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_USE_OIDC: true # Tell the azurerm provider to use OIDC
+
+jobs:
+  # ===========================================================================
+  # Terraform Plan — runs on every push and PR
+  # ===========================================================================
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    environment: dev
+    defaults:
+      run:
+        working-directory: ${{ env.TF_DIR }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.5"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -var-file="../environments/dev.tfvars" \
+            -input=false \
+            -no-color \
+            -out=tfplan
+
+      # Post the plan output as a PR comment for review.
+      - name: Comment Plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const plan = `${{ steps.plan.outputs.stdout }}`;
+            const truncated = plan.length > 60000
+              ? plan.substring(0, 60000) + '\n\n... (truncated)'
+              : plan;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `### Terraform Plan\n\`\`\`\n${truncated}\n\`\`\``
+            });
+
+      - name: Upload Plan Artifact
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.TF_DIR }}/tfplan
+          retention-days: 1
+
+  # ===========================================================================
+  # Terraform Apply + Function App Deploy — only on push to main
+  # ===========================================================================
+  deploy:
+    name: Deploy Infrastructure & App
+    needs: terraform-plan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: dev
+    defaults:
+      run:
+        working-directory: ${{ env.TF_DIR }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.5"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.TF_DIR }}
+
+      - name: Terraform Apply
+        run: terraform apply -input=false -auto-approve tfplan
+
+      # Capture Terraform outputs for the Function App deployment step.
+      - name: Get Terraform Outputs
+        id: tf
+        run: |
+          echo "function_app_name=$(terraform output -raw function_app_name)" >> "$GITHUB_OUTPUT"
+          echo "resource_group_name=$(terraform output -raw resource_group_name)" >> "$GITHUB_OUTPUT"
+
+      # Package and deploy the Python Function App.
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Function App Dependencies
+        working-directory: ${{ env.FUNC_DIR }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt --target=".python_packages/lib/site-packages"
+
+      - name: Deploy Function App
+        uses: azure/functions-action@v1
+        with:
+          app-name: ${{ steps.tf.outputs.function_app_name }}
+          package: ${{ env.FUNC_DIR }}
+          respect-funcignore: true
