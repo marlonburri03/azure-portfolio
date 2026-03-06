@@ -1,0 +1,11 @@
+# Azure Functions SDK
+azure-functions>=1.17.0
+
+# Azure Identity — provides DefaultAzureCredential for Managed Identity auth
+azure-identity>=1.15.0
+
+# Cosmos DB SDK — used by service_bus_processor and blob_trigger
+azure-cosmos>=4.5.0
+
+# Service Bus SDK — used by event_grid_handler to enqueue messages
+azure-servicebus>=7.11.0
