@@ -1,0 +1,53 @@
+# KEDA ScaledObject — event-driven autoscaling beyond CPU/memory.
+#
+# This example scales the sample-app deployment based on Azure Service Bus
+# queue depth. KEDA polls the trigger source and adjusts replica count,
+# scaling to zero when idle to minimise cost.
+#
+# Prerequisites:
+#   - KEDA installed in the cluster (helm install keda kedacore/keda)
+#   - Workload Identity configured for the service account (no connection strings)
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: sample-app-scaler
+  namespace: sample-app
+  labels:
+    app.kubernetes.io/name: sample-app
+    app.kubernetes.io/part-of: aks-production-cluster
+spec:
+  scaleTargetRef:
+    name: sample-app
+
+  # Cooldown prevents rapid scale-down thrashing after a burst
+  cooldownPeriod: 120
+
+  # Polling interval determines how frequently KEDA checks the trigger source
+  pollingInterval: 15
+
+  minReplicaCount: 2
+  maxReplicaCount: 20
+
+  triggers:
+    # Scale based on Azure Service Bus queue length.
+    # KEDA authenticates via Workload Identity — no connection string needed.
+    - type: azure-servicebus
+      metadata:
+        queueName: orders
+        namespace: sb-aks-production
+        # Scale up when more than 5 messages are pending per replica
+        messageCount: "5"
+      authenticationRef:
+        name: azure-servicebus-auth
+
+---
+# TriggerAuthentication binds KEDA to the Workload Identity service account.
+# This avoids storing Service Bus connection strings as Kubernetes secrets.
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: azure-servicebus-auth
+  namespace: sample-app
+spec:
+  podIdentity:
+    provider: azure-workload
