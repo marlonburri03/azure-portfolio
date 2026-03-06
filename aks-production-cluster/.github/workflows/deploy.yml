@@ -1,0 +1,225 @@
+# AKS Production Cluster — Deploy Pipeline
+#
+# Uses OIDC federation to authenticate with Azure (no stored secrets).
+# Runs terraform plan on PRs for review, terraform apply on merge to main.
+#
+# Prerequisites:
+#   1. Register an Azure AD application with federated credentials for this repo
+#   2. Set the following GitHub environment variables:
+#      - AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+#   3. Grant the app Contributor + User Access Administrator on the subscription
+name: Deploy AKS Cluster
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "aks-production-cluster/terraform/**"
+      - "aks-production-cluster/environments/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "aks-production-cluster/terraform/**"
+      - "aks-production-cluster/environments/**"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - prod
+
+# Only one deployment per environment at a time to prevent state corruption
+concurrency:
+  group: aks-${{ github.event.inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+# Minimal permissions — OIDC requires id-token: write
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  TF_WORKING_DIR: aks-production-cluster/terraform
+  ARM_USE_OIDC: true
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Terraform Plan — runs on every PR and push
+  # --------------------------------------------------------------------------
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # OIDC auth — exchanges a GitHub JWT for an Azure AD token.
+      # No client secret stored in GitHub — credentials are ephemeral.
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.7"
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -input=false
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan \
+            -var-file=../environments/${{ github.event.inputs.environment || 'dev' }}.tfvars \
+            -out=tfplan \
+            -input=false \
+            -no-color
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Post plan output as a PR comment so reviewers can see the diff
+      - name: Comment Plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `#### Terraform Plan 📋
+            \`\`\`
+            ${{ steps.plan.outputs.stdout }}
+            \`\`\`
+            *Triggered by @${{ github.actor }} on \`${{ github.event.inputs.environment || 'dev' }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+      # Persist plan artifact for the apply job
+      - name: Upload Plan
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.TF_WORKING_DIR }}/tfplan
+          retention-days: 1
+
+  # --------------------------------------------------------------------------
+  # Terraform Apply — only on merge to main (not PRs)
+  # --------------------------------------------------------------------------
+  apply:
+    name: Terraform Apply
+    needs: plan
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.7"
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -input=false
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Download Plan
+        uses: actions/download-artifact@v4.1.8
+        with:
+          name: tfplan
+          path: ${{ env.TF_WORKING_DIR }}
+
+      # Apply the exact plan that was reviewed — no re-planning.
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve -input=false tfplan
+        env:
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+  # --------------------------------------------------------------------------
+  # Deploy Application — Helm upgrade after infra changes
+  # --------------------------------------------------------------------------
+  deploy-app:
+    name: Deploy Sample App
+    needs: apply
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Fetch AKS credentials — uses kubelogin for AAD-integrated clusters
+      - name: Get AKS Credentials
+        run: |
+          az aks get-credentials \
+            --resource-group "rg-aks-cluster-${{ github.event.inputs.environment || 'dev' }}-eastus" \
+            --name "aks-aks-cluster-${{ github.event.inputs.environment || 'dev' }}-eastus" \
+            --overwrite-existing
+
+      - name: Install kubelogin
+        uses: azure/kubelogin@v1
+
+      - name: Convert kubeconfig
+        run: kubelogin convert-kubeconfig -l azurecli
+
+      - name: Deploy with Helm
+        run: |
+          helm upgrade --install sample-app aks-production-cluster/helm/sample-app \
+            --namespace sample-app --create-namespace \
+            --values aks-production-cluster/helm/sample-app/values.yaml \
+            --wait --timeout 5m
+
+      - name: Apply KEDA ScaledObject
+        run: kubectl apply -f aks-production-cluster/manifests/keda-scaledobject.yaml
+
+      - name: Apply SecretProviderClass
+        run: kubectl apply -f aks-production-cluster/manifests/secrets-provider-class.yaml
