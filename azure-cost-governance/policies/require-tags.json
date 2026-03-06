@@ -1,0 +1,21 @@
+{
+  "if": {
+    "anyOf": [
+      {
+        "field": "[concat('tags[', parameters('requiredTags')[0], ']')]",
+        "exists": "false"
+      },
+      {
+        "field": "[concat('tags[', parameters('requiredTags')[1], ']')]",
+        "exists": "false"
+      },
+      {
+        "field": "[concat('tags[', parameters('requiredTags')[2], ']')]",
+        "exists": "false"
+      }
+    ]
+  },
+  "then": {
+    "effect": "deny"
+  }
+}
