@@ -1,13 +1,6 @@
 # Azure Portfolio
 
-<p align="center">
-  <a href="https://learn.microsoft.com/en-us/certifications/azure-fundamentals/"><img src="https://img.shields.io/badge/AZ--900-Azure%20Fundamentals-0078D4?style=for-the-badge&logo=microsoftazure&logoColor=white" alt="AZ-900"></a>&nbsp;
-  <a href="https://learn.microsoft.com/en-us/certifications/azure-administrator/"><img src="https://img.shields.io/badge/AZ--104-Azure%20Administrator-0078D4?style=for-the-badge&logo=microsoftazure&logoColor=white" alt="AZ-104"></a>&nbsp;
-  <a href="https://learn.microsoft.com/en-us/certifications/azure-solutions-architect/"><img src="https://img.shields.io/badge/AZ--305-Solutions%20Architect%20Expert-0078D4?style=for-the-badge&logo=microsoftazure&logoColor=white" alt="AZ-305"></a>&nbsp;
-  <a href="https://learn.microsoft.com/en-us/certifications/devops-engineer/"><img src="https://img.shields.io/badge/AZ--400-DevOps%20Engineer%20Expert-0078D4?style=for-the-badge&logo=microsoftazure&logoColor=white" alt="AZ-400"></a>
-</p>
-
----
+Reference implementations of Azure platform patterns: landing zone, AKS, CI/CD pipelines, serverless, observability, cost governance, Zero Trust and Bicep modules.
 
 ## Architecture — Hub & Spoke Topology
 
@@ -84,13 +77,15 @@ graph TD
 
 ## Featured Projects
 
-| Repository | Description |
+Reference implementations in this repository, one folder per topic. They show patterns and code structure and are not deployed environments; values such as subscription IDs and address ranges are examples.
+
+| Folder | Description |
 |---|---|
-| [`azure-landing-zone-terraform`](https://github.com/azure-landing-zone-terraform) | Enterprise-scale landing zone — management groups, policy assignments, and connectivity |
-| [`aks-production-cluster`](https://github.com/aks-production-cluster) | Production AKS with private API server, Workload Identity, and Azure CNI Overlay |
-| [`azure-devops-cicd-pipelines`](https://github.com/azure-devops-cicd-pipelines) | Multi-stage YAML pipelines with environment approvals and template libraries |
-| [`azure-serverless-event-pipeline`](https://github.com/azure-serverless-event-pipeline) | Event-driven architecture — Event Grid, Functions, Service Bus, Cosmos DB |
-| [`azure-observability-stack`](https://github.com/azure-observability-stack) | Centralized monitoring with Azure Monitor, Log Analytics, Grafana, and alert routing |
-| [`azure-cost-governance`](https://github.com/azure-cost-governance) | FinOps tooling — budgets, anomaly detection, and automated right-sizing recommendations |
-| [`azure-zero-trust-architecture`](https://github.com/azure-zero-trust-architecture) | Zero Trust reference — Conditional Access, Private Link, NSG flow logs, and Defender for Cloud |
-| [`azure-bicep-module-library`](https://github.com/azure-bicep-module-library) | Reusable Bicep modules with versioned registry publishing and validation tests |
+| [`azure-landing-zone-terraform`](azure-landing-zone-terraform/) | Enterprise-scale landing zone — management groups, policy assignments, and connectivity |
+| [`aks-production-cluster`](aks-production-cluster/) | Production AKS with private API server, Workload Identity, and Azure CNI Overlay |
+| [`azure-devops-cicd-pipelines`](azure-devops-cicd-pipelines/) | Multi-stage YAML pipelines with environment approvals and template libraries |
+| [`azure-serverless-event-pipeline`](azure-serverless-event-pipeline/) | Event-driven architecture — Event Grid, Functions, Service Bus, Cosmos DB |
+| [`azure-observability-stack`](azure-observability-stack/) | Centralized monitoring with Azure Monitor, Log Analytics, Grafana, and alert routing |
+| [`azure-cost-governance`](azure-cost-governance/) | FinOps tooling — budgets, anomaly detection, and automated right-sizing recommendations |
+| [`azure-zero-trust-architecture`](azure-zero-trust-architecture/) | Zero Trust reference — Conditional Access, Private Link, NSG flow logs, and Defender for Cloud |
+| [`azure-bicep-module-library`](azure-bicep-module-library/) | Reusable Bicep modules with versioned registry publishing and validation tests |
